@@ -3,13 +3,14 @@
 import copy
 import shutil
 from pathlib import Path
+from typing import Iterator
 
 import torch
 from torch import nn
 from torch.func import grad, vmap
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-from dattri.algorithm.tracin import DataloaderGroup, TracInAttributor
+from dattri.algorithm.tracin import TracInAttributor
 from dattri.benchmark.datasets.cifar import train_cifar_resnet9
 from dattri.benchmark.datasets.mnist import train_mnist_lr, train_mnist_mlp
 from dattri.func.utils import flatten_func, flatten_params
@@ -515,6 +516,43 @@ class TestTracInAttributor:
 
     def test_tracin_dataloader(self):
         """Verify TracIn Group Attribution correctness."""
+
+        class DataloaderGroup(DataLoader):
+            """Helper class to wrap a DataLoader for group attribution.
+
+            This wrapper presents the dataloader as a single item (length 1).
+            When iterated, it yields the original dataloader itself, allowing the
+            consumer to treat the entire dataset as one attribution target.
+            """
+
+            def __init__(self, original_test_dataloader: DataLoader) -> None:
+                """Initialize the DataloaderGroup.
+
+                Args:
+                    original_test_dataloader (DataLoader):
+                        The PyTorch dataloader for individual test data samples
+                """
+                super().__init__(
+                    torch.utils.data.TensorDataset(torch.zeros(1)),
+                )
+                self.original_test_dataloader = original_test_dataloader
+
+            def __iter__(self) -> Iterator[DataLoader]:
+                """Iterate over the group.
+
+                Yields:
+                    DataLoader: Yields the original dataloader as a single object.
+                """
+                yield self.original_test_dataloader
+
+            def __len__(self) -> int:
+                """Return the length of the group wrapper.
+
+                Returns:
+                    int: Always 1, as the whole dataset is treated as one group.
+                """
+                return 1
+
         train_loader = DataLoader(
             TensorDataset(
                 torch.randn(20, 1, 28, 28),
@@ -553,10 +591,20 @@ class TestTracInAttributor:
             yhat = torch.func.functional_call(model, params, image_t)
             return loss(yhat, label_t)
 
+        def group_target_func(params, loader):
+            loss_fn = nn.CrossEntropyLoss(reduction="sum")
+            total = None
+            for image, label in loader:
+                yhat = torch.func.functional_call(model, params, (image,))
+                loss = loss_fn(yhat, label.long())
+                total = loss if total is None else total + loss
+            return total
+
         task = AttributionTask(
             loss_func=f,
             model=model,
             checkpoints=checkpoint_list,
+            group_target_func=group_target_func,
         )
 
         attributor = TracInAttributor(
