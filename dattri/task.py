@@ -14,8 +14,9 @@ from pathlib import PosixPath
 import torch
 from torch import nn
 from torch.func import grad, vmap
+from torch.utils.data import DataLoader
 
-from dattri.func.utils import flatten_func, flatten_params, partial_param
+from dattri.func.utils import _unflatten_params, flatten_func, flatten_params, partial_param
 
 
 def _default_checkpoint_load_func(
@@ -52,6 +53,7 @@ class AttributionTask:
         ],
         target_func: Optional[Callable] = None,
         checkpoints_load_func: Optional[Callable] = None,
+        group_target_func: Optional[Callable] = None,
     ) -> None:
         """Initialize the AttributionTask.
 
@@ -108,8 +110,13 @@ class AttributionTask:
                     model.eval()
                     return model
                 ```.
+            group_target_func (Callable): Optional. When attributing to a group (e.g. a
+                DataLoader passed via DataloaderGroup), this scalar function is used
+                instead of the per-sample target. Signature (params_dict, loader) -> scalar.
+                The gradient of this w.r.t. params is the test-side gradient for the group.
         """
         self.model = model
+        self.group_target_func = group_target_func
         if target_func is None:
             target_func = loss_func
 
@@ -256,7 +263,34 @@ class AttributionTask:
                 randomness="different",
             )
             self.grad_target_func_kwargs = grad_target_func_kwargs
-        return self.grad_target_func
+
+        base_grad_target = self.grad_target_func
+        group_target_func = self.group_target_func
+        model_ref = self.model
+
+        def wrapped(parameters, data):
+            if isinstance(data, DataLoader):
+                if group_target_func is None:
+                    raise ValueError(
+                        "A DataLoader was passed (e.g. via DataloaderGroup) but this "
+                        "AttributionTask was not given group_target_func. For group "
+                        "attribution, pass group_target_func=(params_dict, loader) -> scalar."
+                    )
+                # Pre-fetch batches outside grad to avoid tracing DataLoader/dataset
+                # access (e.g. .numpy() in dataset __getitem__) which can raise
+                # "Tensor that doesn't have storage" when run inside autograd.
+                batches = list(data)
+
+                def flat_group_target(flat_params):
+                    params_dict = _unflatten_params(flat_params, model_ref)
+                    return group_target_func(params_dict, batches)
+
+                g = grad(flat_group_target)(parameters)
+                return g.unsqueeze(0)
+
+            return base_grad_target(parameters, data)
+
+        return wrapped
 
     def get_target_func(
         self,
