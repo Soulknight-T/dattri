@@ -98,10 +98,7 @@ class TracInAttributor(BaseAttributor):
             Tensor: The influence of the training set on the test set, with
                 the shape of (num_train_samples, num_test_samples).
         """
-        if hasattr(test_dataloader, "original_test_dataloader"):
-            _check_shuffle(test_dataloader.original_test_dataloader)
-        else:
-            _check_shuffle(test_dataloader)
+        _check_shuffle(test_dataloader)
         _check_shuffle(train_dataloader)
 
         # check the length match between checkpoint list and weight list
