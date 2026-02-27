@@ -1,14 +1,18 @@
 """This example shows how to use TracInAttributor with DataloaderGroup and a
 user-defined group target via AttributionTask (group_target_func).
+Uses MNIST + MLP.
 """
 
+import argparse
 from typing import Iterator
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 from dattri.algorithm.tracin import TracInAttributor
+from dattri.benchmark.datasets.mnist import create_mnist_dataset, train_mnist_mlp
+from dattri.benchmark.utils import SubsetSampler
 from dattri.task import AttributionTask
 
 
@@ -48,35 +52,58 @@ class DataloaderGroup(DataLoader):
 
 
 if __name__ == "__main__":
-    torch.manual_seed(42)
-    input_dim, n_train, n_test = 2, 10, 5
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--train_size", type=int, default=10000)
+    parser.add_argument("--test_size", type=int, default=5000)
+    args = parser.parse_args()
 
-    model = nn.Linear(input_dim, 1, bias=False)
-    model.weight.data.fill_(1.0)
+    print(args)
 
+    # load the training dataset (same as influence_function_data_cleaning.py)
+    dataset, dataset_test = create_mnist_dataset("./data")
+
+    # for model training, batch size is 64
+    train_loader_full = DataLoader(
+        dataset,
+        batch_size=64,
+        sampler=SubsetSampler(range(args.train_size)),
+    )
+
+    # training samples for attribution; batch size 1000 to speed up
     train_loader = DataLoader(
-        TensorDataset(torch.randn(n_train, input_dim), torch.randn(n_train, 1)),
-        batch_size=2,
+        dataset,
+        batch_size=1000,
+        sampler=SubsetSampler(range(args.train_size)),
     )
     test_loader = DataLoader(
-        TensorDataset(torch.randn(n_test, input_dim), torch.randn(n_test, 1)),
-        batch_size=2,
+        dataset_test,
+        batch_size=1000,
+        sampler=SubsetSampler(range(args.test_size)),
     )
 
-    # loss and target in AttributionTask style: (params_dict, data) -> scalar
-    def f(params, data):
-        x, y = data
-        yhat = torch.func.functional_call(model, params, (x,))
-        return ((yhat - y) ** 2).mean()
+    model = train_mnist_mlp(train_loader_full, seed=args.seed)
+    model.to(args.device)
+    model.eval()
 
-    # user-defined scalar target for group attribution: (params_dict, loader) -> scalar
-    # the gradient of this w.r.t. params is the test-side gradient for the group
+    # loss and target in AttributionTask style; match IF example signature
+    def f(params, data_target_pair):
+        image, label = data_target_pair
+        label = label.view(-1).long()
+        yhat = torch.func.functional_call(model, params, (image,))
+        return nn.CrossEntropyLoss()(yhat, label)
+
+    # group target: gradient = sum of per-sample gradients (use loss * batch_size)
     def group_target_func(params, loader):
+        device = next(iter(params.values())).device
         total = None
         for batch in loader:
-            x, y = batch
-            loss = f(params, (x, y))
-            total = loss if total is None else total + loss
+            image, label = batch
+            image, label = image.to(device), label.to(device)
+            loss = f(params, (image, label))
+            n = image.shape[0]
+            total = loss * n if total is None else total + loss * n
         return total
 
     task = AttributionTask(
@@ -91,14 +118,18 @@ if __name__ == "__main__":
         task=task,
         weight_list=torch.tensor([1.0]),
         normalized_grad=False,
-        device="cpu",
+        device=args.device,
     )
     attributor.projector_kwargs = None
 
     test_group = DataloaderGroup(test_loader)
     with torch.no_grad():
         scores = attributor.attribute(train_loader, test_group)
+        scores_temp = attributor.attribute(train_loader, test_loader)
 
-    print("Test Dataloader Group (AttributionTask + group_target_func).")
+    print("Test Dataloader Group (AttributionTask + group_target_func) — MNIST + MLP.")
     print(f"Score Shape: {scores.shape}")
-    print(f"Calculated Scores:\n{scores.flatten()}")
+    print(f"Calculated Scores (first 10):\n{scores.flatten()[:10]}")
+    print(f"Calculated Scores Temp sum over test (first 10):\n{scores_temp.sum(dim=1)[:10]}")
+    diff = (scores.flatten() - scores_temp.sum(dim=1)).abs()
+    print(f"Max |group - sum(per-test)|: {diff.max().item():.6f}")
